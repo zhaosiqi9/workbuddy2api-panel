@@ -1,7 +1,9 @@
 name: sync-upstream
 
 # 把父仓库（upstream）的更新同步进本 fork：
-#   - sync-main：合并 upstream/main → build + test 验证 → push（上游有新提交时）
+#   - sync-main：维护 main 的不变量 upstream/main ∪ FORK_BRANCHES → build + test
+#     验证 → push。上游有新提交就合并；main 被外部硬重置（Pull 应用默认行为）
+#     导致 fork 独有分支不在 main 里，就自动合回来（自愈，见该 step 注释）。
 #   - sync-tags：把上游新增的 v* tag 逐个推到 fork（上游发版即自动产出 Release 与版本化镜像）
 #   触发：schedule 每日定时 + workflow_dispatch 手动
 #
@@ -44,52 +46,81 @@ jobs:
           fetch-depth: 0
           ref: main
 
-      - name: Fetch upstream (parent repo)
+      - name: Fetch upstream (parent repo) + fork branches
         run: |
           git remote add upstream https://github.com/linguo2625469/workbuddy2api-panel.git
           git fetch upstream --prune
+          git fetch origin --prune "+refs/heads/*:refs/remotes/origin/*" # fork 独有分支（main 自愈用；显式 refspec 不依赖 checkout 留下的配置）
           echo "behind: $(git rev-list --count HEAD..upstream/main)"
           echo "ahead:  $(git rev-list --count upstream/main..HEAD)"
 
-      - name: Merge upstream/main
-        id: merge
+      # main 的不变量：upstream/main ∪ FORK_BRANCHES。两步都是普通合并，绝不 reset/force：
+      #   1) 上游有新提交 → 合并（保留本 fork 独有提交）
+      #   2) fork 独有分支不在 main 历史里（main 被外部硬重置）→ 自动合回来
+      # 因此即使 Pull 应用仍在本仓库硬重置 main，PR#63 也会在次日定时任务里自动恢复。
+      - name: Sync main (merge upstream + ensure fork branches)
+        id: sync
+        env:
+          FORK_BRANCHES: feat/anthropic-messages-responses
         run: |
-          if git merge-base --is-ancestor upstream/main HEAD; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "已是最新，无需同步。"
-            exit 0
-          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          sha=$(git rev-parse --short upstream/main)
-          if git merge --no-ff -m "chore(sync): 自动合并上游 upstream/main@${sha}" upstream/main; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "已合并上游 ${sha}（本 fork 独有提交原样保留）"
+          echo "BASE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          changed=false
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "上游无新提交。"
           else
-            git merge --abort || true
-            echo "::error::上游合并存在冲突，已中止（main 未改动）。请本地处理：git fetch origin && git merge origin/main，解冲突后 push。"
-            exit 1
+            sha=$(git rev-parse --short upstream/main)
+            if git merge --no-ff -m "chore(sync): 自动合并上游 upstream/main@${sha}" upstream/main; then
+              echo "已合并上游 ${sha}（fork 独有提交原样保留）"
+              changed=true
+            else
+              git merge --abort || true
+              echo "::error::上游合并存在冲突，已中止（main 未改动）。请本地处理：git fetch origin && git merge origin/main，解冲突后 push。"
+              exit 1
+            fi
           fi
 
+          for br in $FORK_BRANCHES; do
+            if ! git rev-parse --verify --quiet "origin/${br}" >/dev/null; then
+              echo "::warning::origin/${br} 不存在，跳过（若该分支已不再需要，请从本文件的 FORK_BRANCHES 删掉）"
+              continue
+            fi
+            if git merge-base --is-ancestor "origin/${br}" HEAD; then
+              echo "main 已包含：${br}"
+            elif git merge --no-ff -m "chore(sync): 恢复 fork 独有分支 ${br}" "origin/${br}"; then
+              echo "main 缺失 ${br} 的内容（疑似被硬重置），已自动合回"
+              changed=true
+            else
+              git merge --abort || true
+              echo "::error::恢复 ${br} 时合并冲突，已中止（main 未改动）。"
+              exit 1
+            fi
+          done
+
+          echo "changed=${changed}" >> "$GITHUB_OUTPUT"
+          echo "本次有改动：${changed}"
+
       - name: Setup Go
-        if: steps.merge.outputs.changed == 'true'
+        if: steps.sync.outputs.changed == 'true'
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
       - name: Verify merged tree (build + tests)
-        if: steps.merge.outputs.changed == 'true'
+        if: steps.sync.outputs.changed == 'true'
         run: |
           if go build ./... && go test ./...; then
             echo "合并结果验证通过。"
           else
-            git reset --hard ORIG_HEAD
-            echo "::error::合并结果未通过 build/test，已丢弃合并提交（main 未改动）。请本地复现：git fetch origin && git merge origin/main。"
+            git reset --hard "$BASE"
+            echo "::error::合并结果未通过 build/test，已丢弃本次合并（main 未改动）。请本地复现：git fetch origin && git merge origin/main。"
             exit 1
           fi
 
       - name: Push to fork
-        if: steps.merge.outputs.changed == 'true'
+        if: steps.sync.outputs.changed == 'true'
         run: git push origin main
 
   sync-tags:
