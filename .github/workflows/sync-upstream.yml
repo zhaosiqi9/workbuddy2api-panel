@@ -1,26 +1,27 @@
 name: sync-upstream
 
-# 把父仓库（upstream）的更新合并进本 fork 的 main：
-#   - schedule 每日定时检查，上游有新提交就 merge 后推送
-#   - workflow_dispatch 手动触发
+# 把父仓库（upstream）的更新同步进本 fork：
+#   - sync-main：合并 upstream/main → build + test 验证 → push（上游有新提交时）
+#   - sync-tags：把上游新增的 v* tag 逐个推到 fork（上游发版即自动产出 Release 与版本化镜像）
+#   触发：schedule 每日定时 + workflow_dispatch 手动
 #
-# 为什么是 merge 而不是 --ff-only：
+# 为什么 main 是 merge 而不是 --ff-only：
 #   本 fork 的 main 长期带有上游没有的提交（PR#63：Codex Responses /
 #   Anthropic Messages 入站适配；上游 2026-09-28 按项目定位取舍关闭、未合并）。
-#   旧版用 `git merge --ff-only`，一旦分叉就永远跳过同步——分叉是常态，等于从不
-#   同步。现改为普通合并：冲突时中止（main 保持不动）并让 job 失败告警，交人工处理。
+#   旧版 `git merge --ff-only` 一旦分叉就永远跳过同步——分叉是常态，等于从不同步。
+#   现改为普通合并：冲突时中止（main 保持不动）并让 job 失败告警，交人工处理。
 #
 # 为什么同步得由本 workflow 负责（fork 侧根因）：
 #   本仓库原先装了 Pull 应用（pull[bot]）。它在本 fork 没有 .github/pull.yml 时
 #   默认按 hard reset 同步，会把 fork 独有提交连文件一起清掉（2026-09-30 的
 #   28532ae / 31277f8 就是这样丢的）。.github/pull.yml 作为防重置兜底保留。
 #
-# 说明：
-#   - 只同步 main、不推 tag：推 v* tag 会在本 fork 触发 go-binaries 的 Release
-#     打包与 docker-ghcr 的多架构镜像构建。确实需要 tag 时，把下面 push 步骤换成
-#     `git push --follow-tags`。
-#   - 合并后先本地验证（build + 全量测试）再 push：能编译但跑挂的语义冲突不会
-#     污染 main；验证失败时丢弃合并提交并报错。
+# 关于 tag（有意接受的副作用）：
+#   sync-tags 推 v* tag 会在本 fork 触发 go-binaries 的 Release 打包与 docker-ghcr
+#   的多架构镜像构建。这些 tag 忠实指向上游提交，因此版本化产物（Release 资产、
+#   :1.11.x 镜像）是纯上游代码；含 PR#63 的是 main 分支产物（:latest / :main）。
+#   同名 tag 已存在但指向不同提交时：报错并让人工确认，绝不强推改写 tag
+#   （改写会破坏"同名 tag 指同一提交"的既有语义）。
 on:
   schedule:
     - cron: "0 3 * * *" # UTC 03:00 = 北京时间 11:00
@@ -34,7 +35,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  sync:
+  sync-main:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fork main
@@ -90,3 +91,46 @@ jobs:
       - name: Push to fork
         if: steps.merge.outputs.changed == 'true'
         run: git push origin main
+
+  sync-tags:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork main (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0 # tag 指向的提交必须在本地，否则无法推送该 tag
+          fetch-tags: true
+
+      - name: Fetch upstream tags
+        run: |
+          git remote add upstream https://github.com/linguo2625469/workbuddy2api-panel.git
+          git fetch upstream --tags --prune
+
+      - name: Push new upstream tags
+        run: |
+          # 逐个上游 v* tag 比对：fork 缺失则按上游的 sha 推送；同名但指向不同提交则报错
+          # （不强推改写 tag）。用 ls-remote 取远端真实 sha，避免被本地同名旧 tag 误导。
+          git ls-remote --tags --refs upstream | awk '{print $2" "$1}' | sed 's|refs/tags/||' > /tmp/up.txt
+          git ls-remote --tags --refs origin   | awk '{print $2" "$1}' | sed 's|refs/tags/||' > /tmp/org.txt
+          new=0
+          bad=0
+          while read -r tag sha; do
+            case "$tag" in
+              v*) ;;
+              *) echo "跳过非 v* tag：$tag"; continue ;;
+            esac
+            osha=$(awk -v k="$tag" '$1 == k {print $2}' /tmp/org.txt)
+            if [ -z "$osha" ]; then
+              echo "推送新 tag：$tag -> $sha"
+              git push origin "${sha}:refs/tags/${tag}" || bad=$((bad + 1))
+              new=$((new + 1))
+            elif [ "$osha" != "$sha" ]; then
+              echo "::error::tag $tag 在 fork 上已存在但指向 $osha，与上游 $sha 不同；不会强推改写，请人工确认。"
+              bad=$((bad + 1))
+            else
+              echo "已同步：$tag"
+            fi
+          done < /tmp/up.txt
+          echo "本次新推 tag：$new，异常：$bad"
+          [ "$bad" -eq 0 ]
