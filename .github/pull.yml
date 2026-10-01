@@ -1,0 +1,17 @@
+# Pull 应用（pull[bot]）配置 —— 兜底，防"硬重置"。
+#
+# 该应用在没有本文件时默认 hard reset：定期把本 fork 的 main 硬重置成上游，
+# 会连同 fork 独有提交（PR#63 Codex Responses / Anthropic Messages 入站适配）
+# 与其携带的文件一起清掉——2026-09-30 已实际发生一次。
+#
+# 本仓库的同步已改由 .github/workflows/sync-upstream.yml 负责（合并 + 合并后
+# build/test 验证）。本文件仅作兜底：万一该应用仍对本仓库有权限，让它"合并"
+# 而不是"重置"，最坏情况下也不会丢提交。
+#
+# 已在 https://github.com/settings/installations 撤销 Pull 应用对本仓库的访问
+# 之后，本文件即可删除。
+version: "1"
+rules:
+  - base: main
+    upstream: linguo2625469:main
+    mergeMethod: merge

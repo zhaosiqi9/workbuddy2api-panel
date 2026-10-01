@@ -1,16 +1,26 @@
 name: sync-upstream
 
-# 自动同步父仓库（upstream）更新：
-#   - schedule 每日定时检查，父仓库有新提交时把本 fork 的 main 快进到上游
+# 把父仓库（upstream）的更新合并进本 fork 的 main：
+#   - schedule 每日定时检查，上游有新提交就 merge 后推送
 #   - workflow_dispatch 手动触发
 #
-# 说明：本仓库是 linguo2625469/workbuddy2api-panel 的 fork，父仓库即上游。
-#   - 仅当本 fork 的 main 无本地独有提交时才快进；一旦出现分叉就跳过并在
-#     日志里告警，交给人工 rebase / PR，避免定时任务把分叉静默合并掉。
-#   - 默认只同步 main、不推 tag：推 v* tag 会在本 fork 触发 go-binaries 的
-#     Release 打包与 docker-ghcr 的多架构镜像构建。确实需要 tag 时，把下面
-#     push 步骤的 --follow-tags 打开即可。
-#   - 快进后 push 到本 fork 的 main，会照常触发 go-binaries / docker-ghcr。
+# 为什么是 merge 而不是 --ff-only：
+#   本 fork 的 main 长期带有上游没有的提交（PR#63：Codex Responses /
+#   Anthropic Messages 入站适配；上游 2026-09-28 按项目定位取舍关闭、未合并）。
+#   旧版用 `git merge --ff-only`，一旦分叉就永远跳过同步——分叉是常态，等于从不
+#   同步。现改为普通合并：冲突时中止（main 保持不动）并让 job 失败告警，交人工处理。
+#
+# 为什么同步得由本 workflow 负责（fork 侧根因）：
+#   本仓库原先装了 Pull 应用（pull[bot]）。它在本 fork 没有 .github/pull.yml 时
+#   默认按 hard reset 同步，会把 fork 独有提交连文件一起清掉（2026-09-30 的
+#   28532ae / 31277f8 就是这样丢的）。.github/pull.yml 作为防重置兜底保留。
+#
+# 说明：
+#   - 只同步 main、不推 tag：推 v* tag 会在本 fork 触发 go-binaries 的 Release
+#     打包与 docker-ghcr 的多架构镜像构建。确实需要 tag 时，把下面 push 步骤换成
+#     `git push --follow-tags`。
+#   - 合并后先本地验证（build + 全量测试）再 push：能编译但跑挂的语义冲突不会
+#     污染 main；验证失败时丢弃合并提交并报错。
 on:
   schedule:
     - cron: "0 3 * * *" # UTC 03:00 = 北京时间 11:00
@@ -37,24 +47,46 @@ jobs:
         run: |
           git remote add upstream https://github.com/linguo2625469/workbuddy2api-panel.git
           git fetch upstream --prune
-
-      - name: Fast-forward main if possible
-        id: ff
-        run: |
-          behind=$(git rev-list --count HEAD..upstream/main)
-          echo "behind: $behind"
+          echo "behind: $(git rev-list --count HEAD..upstream/main)"
           echo "ahead:  $(git rev-list --count upstream/main..HEAD)"
-          if [ "$behind" -eq 0 ]; then
+
+      - name: Merge upstream/main
+        id: merge
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "已是最新，无需同步。"
-          elif git merge-base --is-ancestor HEAD upstream/main; then
-            git merge --ff-only upstream/main
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          sha=$(git rev-parse --short upstream/main)
+          if git merge --no-ff -m "chore(sync): 自动合并上游 upstream/main@${sha}" upstream/main; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "已合并上游 ${sha}（本 fork 独有提交原样保留）"
           else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::本 fork 的 main 存在上游没有的提交，已跳过自动同步；请人工 rebase 或开 PR。"
+            git merge --abort || true
+            echo "::error::上游合并存在冲突，已中止（main 未改动）。请本地处理：git fetch origin && git merge origin/main，解冲突后 push。"
+            exit 1
+          fi
+
+      - name: Setup Go
+        if: steps.merge.outputs.changed == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Verify merged tree (build + tests)
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          if go build ./... && go test ./...; then
+            echo "合并结果验证通过。"
+          else
+            git reset --hard ORIG_HEAD
+            echo "::error::合并结果未通过 build/test，已丢弃合并提交（main 未改动）。请本地复现：git fetch origin && git merge origin/main。"
+            exit 1
           fi
 
       - name: Push to fork
-        if: steps.ff.outputs.changed == 'true'
+        if: steps.merge.outputs.changed == 'true'
         run: git push origin main
