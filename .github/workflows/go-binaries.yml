@@ -3,6 +3,10 @@ name: go-binaries
 # 可运行二进制构建/发布：
 #   - PR / push main → 测试 + 五平台编译验证（产物仅存 artifact，不发布）
 #   - push v* tag    → 同上 + 打包上传到 GitHub Release（zip/tar.gz + checksums）
+# 两条版本线（完整约定见 sync-upstream.yml 文件头）：
+#   - 上游线 tag v1.11.11        → 纯上游提交的代码，Release 里不带 PR#63
+#   - fork 线 tag v1.11.11-panel → 打在 fork main 上，含 PR#63（Codex Responses /
+#     Anthropic Messages 入站）；由 sync-upstream 的 sync-main 自动打 tag 并派发
 # 固化的发布纪律（曾两次人祸，见仓库 HANDOFF）：-s -w 剥离、二进制版本串 == 源码
 # appVersion、tag 版本 == 源码版本（-ci 后缀的测试 tag 豁免，用于演练发布线）。
 on:
@@ -111,16 +115,27 @@ jobs:
           fetch-depth: 0   # 取历史 tag 算 compare 链接
       - name: tag 与源码版本一致性断言
         run: |
-          SRC=$(grep -oP 'appVersion = "\K[^"]+' cmd/server/main.go)
-          SRC="${SRC%-panel}"   # appVersion 带 -panel 后缀，比对前剥掉
+          SRC=$(grep -oP 'appVersion = "\K[^"]+' cmd/server/main.go)   # 形如 1.11.11-panel
+          SRCBASE="${SRC%%-panel*}"                                   # 剥 -panel / -panel.N → 1.11.11
           TAG="${GITHUB_REF_NAME#v}"
-          if [[ "$GITHUB_REF_NAME" != *-ci ]]; then
-            if [[ "$TAG" != "$SRC" ]]; then
-              echo "::error::tag $GITHUB_REF_NAME 与源码 appVersion=$SRC 不一致（先提交版本号再打 tag）"
-              exit 1
-            fi
-          else
+          if [[ "$GITHUB_REF_NAME" == *-ci ]]; then
             echo "演练 tag（-ci 后缀）跳过一致性断言：tag=$TAG src=$SRC"
+          elif [[ "$TAG" == "$SRC" || "$TAG" == "$SRCBASE" ]]; then
+            # fork 版本线 tag（v1.11.11-panel）比对全称；上游 tag（v1.11.11）比对剥后缀的基名
+            echo "tag $GITHUB_REF_NAME 与源码 appVersion=$SRC 一致"
+          else
+            echo "::error::tag $GITHUB_REF_NAME 与源码 appVersion=$SRC 不一致（先提交版本号再打 tag）"
+            exit 1
+          fi
+      - name: Release 名称与来源说明
+        id: rel
+        run: |
+          # 名称恒等于 tag 名，避免两条线在 Releases 页出现同名条目
+          echo "name=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF_NAME" == *-panel* ]]; then
+            echo "note=fork 版本线（tag 名带 \`-panel\`）：产物来自本 fork 的 main，含上游未合并的 PR#63（Codex Responses / Anthropic Messages 入站）。" >> "$GITHUB_OUTPUT"
+          else
+            echo "note=上游原样版本：产物来自上游提交 $GITHUB_REF_NAME，**不含**本 fork 的 PR#63；要 PR#63 请用 \`-panel\` 版本线或 \`:latest\` 镜像。" >> "$GITHUB_OUTPUT"
           fi
       - uses: actions/download-artifact@v4
         with:
@@ -135,10 +150,13 @@ jobs:
           echo "prev=${PREV}" >> "$GITHUB_OUTPUT"
       - uses: softprops/action-gh-release@v2
         with:
-          name: ${{ github.ref_name }}-panel
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          name: ${{ steps.rel.outputs.name }}
+          # 只有 -ci 演练 tag 是 prerelease；-panel 是正式版本线，必须算正式发布
+          prerelease: ${{ contains(github.ref_name, '-ci') }}
           body: |
             CI 自动构建发布（五平台二进制 + checksums）。
+
+            ${{ steps.rel.outputs.note }}
 
             完整变更：https://github.com/${{ github.repository }}/compare/${{ steps.prev.outputs.prev }}...${{ github.ref_name }}
           files: dist/*

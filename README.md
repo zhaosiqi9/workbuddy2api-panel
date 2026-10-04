@@ -243,6 +243,20 @@ curl -s http://localhost:7863/healthz
 >
 > 镜像 tag 规则：`main` 分支推送 `latest` / `main` / `sha-xxxxxx`；打 `v*` tag 额外发布
 > `1.2.3` / `1.2` / `1` 语义化版本；PR 仅构建验证、不推送。
+>
+> **本 fork 的版本线**（本仓库是上游 fork，额外带 PR#63：Codex Responses / Anthropic
+> Messages 入站）：版本化产物分两条线，靠 tag 名区分——
+>
+> | 线 | tag | 镜像 | 代码 |
+> |---|---|---|---|
+> | 上游线 | `v1.11.11` | `1.11.11` / `1.11` | 上游提交原样（不含 PR#63） |
+> | fork 线 | `v1.11.11-panel` | `1.11.11-panel` / `1.11-panel` | fork `main`（含 PR#63） |
+>
+> 要用 PR#63 就拉 `ghcr.io/zhaosiqi9/workbuddy2api-panel:1.11.11-panel`（浮动
+> `1.11-panel`）或 `:latest`。执行 `sync-upstream` 时按 `appVersion` 自动打 fork tag
+> 并派发 Release / 镜像；上游线默认不自动产出，需要时手动
+> `gh workflow run go-binaries.yml --ref v1.11.11`（`docker-ghcr.yml` 同理）。
+> 完整约定、自动流程与根因见 [sync-upstream.yml](.github/workflows/sync-upstream.yml) 文件头。
 
 ### 方式一：Docker Compose（推荐服务器部署）
 

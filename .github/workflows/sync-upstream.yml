@@ -4,7 +4,9 @@ name: sync-upstream
 #   - sync-main：维护 main 的不变量 upstream/main ∪ FORK_BRANCHES → build + test
 #     验证 → push。上游有新提交就合并；main 被外部硬重置（Pull 应用默认行为）
 #     导致 fork 独有分支不在 main 里，就自动合回来（自愈，见该 step 注释）。
-#   - sync-tags：把上游新增的 v* tag 逐个推到 fork（上游发版即自动产出 Release 与版本化镜像）
+#   - sync-tags：把上游新增的 v* tag 逐个推到 fork（保持"同名 tag 指同一提交"）
+#   - sync-main 末尾：按 main 的 appVersion 打 fork 版本 tag（v1.11.11-panel）并派发
+#     Release / 镜像构建（见下"两条版本线"）
 #   触发：schedule 每日定时 + workflow_dispatch 手动
 #
 # 为什么 main 是 merge 而不是 --ff-only：
@@ -18,12 +20,25 @@ name: sync-upstream
 #   默认按 hard reset 同步，会把 fork 独有提交连文件一起清掉（2026-09-30 的
 #   28532ae / 31277f8 就是这样丢的）。.github/pull.yml 作为防重置兜底保留。
 #
-# 关于 tag（有意接受的副作用）：
-#   sync-tags 推 v* tag 会在本 fork 触发 go-binaries 的 Release 打包与 docker-ghcr
-#   的多架构镜像构建。这些 tag 忠实指向上游提交，因此版本化产物（Release 资产、
-#   :1.11.x 镜像）是纯上游代码；含 PR#63 的是 main 分支产物（:latest / :main）。
+# 关于 tag：fork 有两条版本线，靠 tag 名区分（本文件头即完整约定）
+#   1) 上游线 v1.11.11（sync-tags 同步）：tag 忠实指向上游提交，产物是纯上游代码。
+#      注意 GITHUB_TOKEN 推 tag **不会**触发 push 事件的工作流（GitHub 硬规则，
+#      2026-10-01 实测：sync-tags 首次推 v1.11.11 后 fork 侧零 tag 运行；同一天上游
+#      13:16 发了 v1.11.11，而 fork 的 Releases 页停在 v1.11.10、ghcr 也缺 1.11.11，
+#      但 tag 列表里 v1.11.11 明明是有的——就是这条规则的指纹）。因此上游线在 fork
+#      里默认不产出 Release / 版本化镜像；需要时手动派发：
+#        gh workflow run go-binaries.yml --ref v1.11.11   # 同理 docker-ghcr.yml
+#   2) fork 线 v1.11.11-panel（sync-main 自动打）：tag 打在 fork main 上，产物含 PR#63
+#      （Codex Responses / Anthropic Messages 入站），镜像 ghcr.io/...:1.11.11-panel。
+#      同样受上述硬规则限制，故 sync-main 用 workflow_dispatch 显式派发（dispatch 是
+#      该规则唯一的例外，官方文档：automatic-token-authentication / triggering-a-workflow）。
+#      版本号没变就不重复发版；要为 fork 独有修复单独发版，把 appVersion 改成
+#      1.11.11-panel.1 之类随 PR 合入 main 即可（go-binaries 断言认全称）。
+#      若 gh workflow run 报 403（组织策略禁用 GITHUB_TOKEN 的 actions: write），
+#      换一枚带 workflow scope 的 PAT 存为 secret，再把下面派发 step 的 GH_TOKEN 换成它。
 #   同名 tag 已存在但指向不同提交时：报错并让人工确认，绝不强推改写 tag
-#   （改写会破坏"同名 tag 指同一提交"的既有语义）。
+#   （改写会破坏"同名 tag 指同一提交"的既有语义）。*-panel 保留给 fork 版本线，
+#   sync-tags 不导入上游的同名 tag。
 on:
   schedule:
     - cron: "0 3 * * *" # UTC 03:00 = 北京时间 11:00
@@ -31,6 +46,7 @@ on:
 
 permissions:
   contents: write
+  actions: write # sync-main 用 gh workflow run 派发 fork 版本线的 Release / 镜像构建
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -123,6 +139,47 @@ jobs:
         if: steps.sync.outputs.changed == 'true'
         run: git push origin main
 
+      # fork 版本线：main 的 appVersion（如 1.11.11-panel）→ tag v1.11.11-panel。
+      # 该 tag 的产物 = main（含 PR#63），与上游 tag（纯上游代码）区分开。
+      # 版本号没变就不发新版（幂等）：需要为 fork 独有修复单独发版时，把 appVersion
+      # 改成 1.11.11-panel.1 之类（go-binaries 的断言认全称），随 PR 合入即可。
+      - name: fork 版本 tag（v<appVersion>）
+        id: ver
+        run: |
+          VER=$(grep -oP 'appVersion = "\K[^"]+' cmd/server/main.go)
+          if [ -z "$VER" ]; then
+            echo "::error::没从 cmd/server/main.go 解析出 appVersion"
+            exit 1
+          fi
+          TAG="v${VER}"
+          HEAD_SHA=$(git rev-parse HEAD)
+          REMOTE_SHA=$(git ls-remote --tags origin "refs/tags/${TAG}" | awk '{print $1}' | head -1)
+          if [ -z "$REMOTE_SHA" ]; then
+            git push origin "HEAD:refs/tags/${TAG}"
+            echo "已创建 fork 版本 tag：${TAG} -> $(git rev-parse --short HEAD)"
+            echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          else
+            # 绝不重写已存在的 tag（与 sync-tags 同一条纪律）
+            if [ "$REMOTE_SHA" != "$HEAD_SHA" ]; then
+              echo "::warning::${TAG} 已存在但指向 ${REMOTE_SHA}，与当前 main $(git rev-parse --short HEAD) 不同；不重写 tag（要发新版请 bump appVersion）"
+            else
+              echo "${TAG} 已存在且指向当前 main，跳过（版本号未变 → 本次不发版）"
+            fi
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      # GITHUB_TOKEN 推的 tag 不会触发 push 事件的工作流（GitHub 硬规则），
+      # 所以这里显式派发；workflow_dispatch 不受该限制。
+      - name: 触发 fork 版本产物（Release + 版本化镜像）
+        if: steps.ver.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          gh workflow run go-binaries.yml --ref "$TAG"
+          gh workflow run docker-ghcr.yml --ref "$TAG"
+          echo "已派发 ${TAG} 的 go-binaries 与 docker-ghcr；运行进度：https://github.com/${GITHUB_REPOSITORY}/actions"
+
   sync-tags:
     runs-on: ubuntu-latest
     steps:
@@ -142,12 +199,17 @@ jobs:
         run: |
           # 逐个上游 v* tag 比对：fork 缺失则按上游的 sha 推送；同名但指向不同提交则报错
           # （不强推改写 tag）。用 ls-remote 取远端真实 sha，避免被本地同名旧 tag 误导。
+          # 注意：这里用 GITHUB_TOKEN 推 tag，GitHub 不会因此启动 go-binaries / docker-ghcr
+          # （GITHUB_TOKEN 事件不触发工作流）。上游线在 fork 的产物需要时手动派发：
+          #   gh workflow run go-binaries.yml --ref <tag>   # 同理 docker-ghcr.yml
+          # fork 自己的版本线由 sync-main 打 tag + 显式派发，见文件头的"两条版本线"。
           git ls-remote --tags --refs upstream | awk '{print $2" "$1}' | sed 's|refs/tags/||' > /tmp/up.txt
           git ls-remote --tags --refs origin   | awk '{print $2" "$1}' | sed 's|refs/tags/||' > /tmp/org.txt
           new=0
           bad=0
           while read -r tag sha; do
             case "$tag" in
+              v*-panel*) echo "跳过上游的 *-panel tag（fork 版本线自有命名空间，避免撞名）：$tag"; continue ;;
               v*) ;;
               *) echo "跳过非 v* tag：$tag"; continue ;;
             esac

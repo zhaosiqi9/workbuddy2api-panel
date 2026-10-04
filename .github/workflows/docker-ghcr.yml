@@ -4,6 +4,10 @@ name: docker-ghcr
 #   - push 到 main / 打 v* tag / 手动触发 → 构建并推送
 #   - PR 触碰构建相关文件 → 仅构建验证，不推送
 # tag 说明：main 推 latest + main + sha-xxxxxx；v1.2.3 推 1.2.3 / 1.2 / 1
+# 两条版本线（完整约定见 sync-upstream.yml 文件头）：
+#   - 上游线 tag v1.11.11        → 1.11.11 / 1.11（纯上游代码）
+#   - fork 线 tag v1.11.11-panel → 1.11.11-panel / 1.11-panel（fork main，含 PR#63）
+#   浮动 tag 按线分开，两条线不会互相覆盖。
 on:
   push:
     branches: [main]
@@ -65,8 +69,11 @@ jobs:
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
+            # v1.11.11 → 1.11.11（上游线） / v1.11.11-panel → 1.11.11-panel（fork 线）
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            # 浮动 tag 按线分开：上游线 1.11，fork 线 1.11-panel
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !contains(github.ref_name, '-panel') }}
+            type=semver,pattern={{major}}.{{minor}}-panel,enable=${{ contains(github.ref_name, '-panel') }}
             type=sha,format=short
 
       - name: Build and push
