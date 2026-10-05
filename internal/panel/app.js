@@ -1,6 +1,6 @@
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
-const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme', LS_ACC_SORT = 'wb2api.accSort';
+const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme', LS_ACC_SORT = 'wb2api.accSort', LS_ACC_ORDER = 'wb2api.accOrder';
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
@@ -15,6 +15,8 @@ let usDim = 'account', usCreditDim = 'account', usSort = 'total';
 let usageData = null;
 let reqRangeState = null; // 请求记录的时间范围（用量页的见 trangeState）
 let accSortMode = localStorage.getItem(LS_ACC_SORT) || 'default';   // 账号池排序（同积分构成页 pkSort）
+let accOrder = (localStorage.getItem(LS_ACC_ORDER) || '').split(',').filter(Boolean);   // 拖拽自定义顺序（uid 列表；uid 不含逗号）
+let dragUID = null, dragOrder0 = '';   // 正在拖的账号 uid / 拖前顺序：拖拽期间挂起轮询重渲染
 const nickShown = new Set();   // 账号池已展开昵称的 uid（点眼睛图标，仅前端显隐、不落盘）
 
 const $ = id => document.getElementById(id);
@@ -359,6 +361,7 @@ setTimeout(() => {
 /* 昵称显隐用的睁眼/闭眼图标（内联 SVG，随 currentColor 变色，不引图标库）。 */
 const EYE_ON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M1.6 8S3.9 3.6 8 3.6 14.4 8 14.4 8 12.1 12.4 8 12.4 1.6 8 1.6 8z"/><circle cx="8" cy="8" r="1.9"/></svg>';
 const EYE_OFF = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M1.6 8S3.9 3.6 8 3.6 14.4 8 14.4 8 12.1 12.4 8 12.4 1.6 8 1.6 8z"/><circle cx="8" cy="8" r="1.9"/><path d="M2.6 13.4 13.4 2.6"/></svg>';
+const GRIP = '<svg viewBox="0 0 10 16" fill="currentColor"><circle cx="3" cy="3" r="1.3"/><circle cx="7" cy="3" r="1.3"/><circle cx="3" cy="8" r="1.3"/><circle cx="7" cy="8" r="1.3"/><circle cx="3" cy="13" r="1.3"/><circle cx="7" cy="13" r="1.3"/></svg>';
 
 // accCooldown 拆出熔断 / 连败降权剩余秒数与取大后的冷却秒数（渲染与排序共用）。
 function accCooldown(s) {
@@ -377,7 +380,10 @@ function accSortList(list) {
   const num = v => { const n = Number(v || 0); return Number.isFinite(n) ? n : 0; };
   const ts = v => { const t = Date.parse(v || ''); return Number.isFinite(t) ? t : 0; };
   const nick = s => String(s.nickname || s.uid || '');
-  if (accSortMode === 'credits') out.sort((a, b) => num(b.credits) - num(a.credits));
+  // 拖拽顺序：在 accOrder 里的按拖过的位置排，没拖过（新增/未入列）的按上游顺序排在后面
+  const pos = new Map(accOrder.map((u, i) => [u, i]));
+  if (accSortMode === 'custom') out.sort((a, b) => (pos.has(a.uid) ? pos.get(a.uid) : accOrder.length) - (pos.has(b.uid) ? pos.get(b.uid) : accOrder.length));
+  else if (accSortMode === 'credits') out.sort((a, b) => num(b.credits) - num(a.credits));
   else if (accSortMode === 'credits_asc') out.sort((a, b) => num(a.credits) - num(b.credits));
   else if (accSortMode === 'healthy') out.sort((a, b) => accRank(a) - accRank(b) || num(b.credits) - num(a.credits));
   else if (accSortMode === 'success') out.sort((a, b) => num(b.success_count) - num(a.success_count));
@@ -387,9 +393,10 @@ function accSortList(list) {
 }
 
 function renderAccounts(list) {
+  if (dragUID) return;   // 拖拽中：5s 轮询重渲染会抽掉正在拖的行
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
   list = accSortList(list);
@@ -428,7 +435,8 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     const shown = nickShown.has(s.uid);
     const nick = s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>';
-    return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
+    return '<tr class="' + cls + '" data-uid="' + esc(s.uid) + '" title="uid: ' + esc(s.uid) + '">' +
+      '<td class="drag" aria-hidden="true"><span class="grip" title="按住拖动排序">' + GRIP + '</span></td>' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       // 账号列：主轴展示完整 UUID，昵称折叠在下、点眼睛图标展开（两者位置互换）
       '<td class="who c-uid"><div class="id uid"><span class="u">' + esc(s.uid) + '</span>' +
@@ -529,6 +537,64 @@ $('accBody').addEventListener('change', async ev => {
     toast(on ? '已启用' : '已禁用', 'ok');
   } catch (e) { cb.checked = !on; toast(e.message, 'err'); }
   finally { cb.disabled = false; loadOverview(true); }
+});
+
+/* 拖拽排序：原生 HTML5 DnD，不引 SortableJS。只在按住把手时把整行设为可拖
+   （整行常驻 draggable 会抢走 UUID 的文本选择）；拖动中实时挪 DOM 当预览，松手
+   时若顺序变了就落定为「自定义」并写 localStorage。拖拽期间 renderAccounts 被
+   dragUID 守卫挡下，避免 5s 轮询把正在拖的行抽掉。 */
+const accOrderFromDom = () => [...$('accBody').querySelectorAll('tr[data-uid]')].map(tr => tr.dataset.uid);
+const accCommitOrder = () => {                    // 把当前 DOM 顺序落定为「自定义」排序
+  accOrder = accOrderFromDom();
+  accSortMode = 'custom';
+  $('accSort').value = 'custom';
+  localStorage.setItem(LS_ACC_ORDER, accOrder.join(','));
+  localStorage.setItem(LS_ACC_SORT, accSortMode);
+};
+$('accBody').addEventListener('mousedown', ev => {
+  const g = ev.target.closest('.grip');
+  if (g) g.closest('tr').draggable = true;
+});
+// 松手即撤销可拖状态。挂在 document 上：拖到表外松手时 tbody 收不到 mouseup，
+// 否则那一行会一直保持可拖、连它的 UUID 都没法选中。
+document.addEventListener('mouseup', () => {
+  $('accBody').querySelectorAll('tr[draggable]').forEach(tr => tr.draggable = false);
+});
+$('accBody').addEventListener('dragstart', ev => {
+  const tr = ev.target.closest('tr[data-uid]');
+  if (!tr || !tr.draggable) return;
+  dragUID = tr.dataset.uid;
+  dragOrder0 = accOrderFromDom().join(',');        // 起始顺序：松手时判「到底动没动」
+  tr.classList.add('dragging');
+  ev.dataTransfer.effectAllowed = 'move';
+  ev.dataTransfer.setData('text/plain', tr.dataset.uid);   // Firefox 不 setData 不会开始拖
+});
+$('accBody').addEventListener('dragover', ev => {
+  const src = $('accBody').querySelector('tr.dragging');
+  if (!src) return;
+  // 关键：每次 dragover 都必须 preventDefault，否则浏览器认为光标下这块不接受 drop。
+  // 实时把行挪到光标处之后，光标往往正落在被拖的那一行上——按「目标不是自己才取消」
+  // 写，最后一次 dragover 就不算数，松手时 drop 不触发，表现为「拖完弹回原位」。
+  ev.preventDefault();
+  const tr = ev.target.closest('tr[data-uid]');
+  if (!tr || tr === src) return;                   // 指到自己这一行：不用挪
+  const r = tr.getBoundingClientRect();
+  tr.parentNode.insertBefore(src, ev.clientY < r.top + r.height / 2 ? tr : tr.nextSibling);
+});
+$('accBody').addEventListener('drop', ev => {
+  if (dragUID) ev.preventDefault();                // 让表格内始终是可落点
+});
+$('accBody').addEventListener('dragend', ev => {
+  const tr = ev.target.closest('tr');
+  if (tr) { tr.draggable = false; tr.classList.remove('dragging'); }
+  if (!dragUID) return;
+  dragUID = null;
+  // 落定放在 dragend 而不是 drop：拖到表外、或浏览器拒绝 drop 时，光标下的顺序
+  // 已经变了，而 drop 可能永远不来——只有 dragend 一定会来。代价是 Esc 也按落定处理。
+  if (accOrderFromDom().join(',') !== dragOrder0) {
+    accCommitOrder();
+    renderAccounts((overviewData && overviewData.accounts) || []);
+  }
 });
 
 /* 账号池排序：选择持久化在 localStorage，跨会话记住（同「积分构成」页 pkSort）。 */
