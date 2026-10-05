@@ -1,6 +1,6 @@
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
-const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme', LS_ACC_SORT = 'wb2api.accSort', LS_ACC_ORDER = 'wb2api.accOrder';
+const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme', LS_ACC_SORT = 'wb2api.accSort', LS_ACC_ORDER = 'wb2api.accOrder', LS_ACC_TAB = 'wb2api.accTab';
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
@@ -16,6 +16,7 @@ let usageData = null;
 let reqRangeState = null; // 请求记录的时间范围（用量页的见 trangeState）
 let accSortMode = localStorage.getItem(LS_ACC_SORT) || 'default';   // 账号池排序（同积分构成页 pkSort）
 let accOrder = (localStorage.getItem(LS_ACC_ORDER) || '').split(',').filter(Boolean);   // 拖拽自定义顺序（uid 列表；uid 不含逗号）
+let accTab = localStorage.getItem(LS_ACC_TAB) || 'cn';   // 账号池分页：cn | global（两个 realm 各自一个独立列表）
 let dragUID = null, dragOrder0 = '';   // 正在拖的账号 uid / 拖前顺序：拖拽期间挂起轮询重渲染
 const nickShown = new Set();   // 账号池已展开昵称的 uid（点眼睛图标，仅前端显隐、不落盘）
 
@@ -392,14 +393,28 @@ function accSortList(list) {
   return out;
 }
 
+// accRealmOf 账号归属的分页：上游 realm 只有 'global' 显式标注，其余都算 CN 版。
+const accRealmOf = s => (s.realm === 'global' ? 'global' : 'cn');
+const ACC_TABS = [['cn', 'CN 版'], ['global', '国际版']];
+
 function renderAccounts(list) {
   if (dragUID) return;   // 拖拽中：5s 轮询重渲染会抽掉正在拖的行
   const tb = $('accBody');
-  if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+  // 两个 realm 各自一个独立列表：分页只渲染选中的那个，排序与拖拽顺序也都只作用于
+  // 本页（拖拽落定只覆盖本页 uid 的槽位，见 accMergeOrder）。
+  const g = list.filter(s => accRealmOf(s) === 'global').length;
+  $('accTabs').innerHTML = usTabsHtml(ACC_TABS, accTab, { cn: list.length - g, global: g });
+  const mine = list.filter(s => accRealmOf(s) === accTab);
+  if (!mine.length) {
+    const label = accTab === 'global' ? '国际版' : 'CN 版';
+    tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">' +
+      (list.length ? label + '暂无账号' : '账号池是空的') + '</div>' +
+      (list.length ? '切到另一个分页看剩下的 ' + list.length + ' 个账号，或点右上角「添加账号」'
+                   : '点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号') +
+      '</div></td></tr>';
     return;
   }
-  list = accSortList(list);
+  list = accSortList(mine);
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
   const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
   tb.innerHTML = list.map(s => {
@@ -544,8 +559,14 @@ $('accBody').addEventListener('change', async ev => {
    时若顺序变了就落定为「自定义」并写 localStorage。拖拽期间 renderAccounts 被
    dragUID 守卫挡下，避免 5s 轮询把正在拖的行抽掉。 */
 const accOrderFromDom = () => [...$('accBody').querySelectorAll('tr[data-uid]')].map(tr => tr.dataset.uid);
+// 一个分页里拖完，只该动本页账号的先后：把新序列填回它们原先占的槽位，另一页的
+// 位置保持不动（否则会把看不见的那一页的 uid 从顺序里挤掉）。没入过列的追加到末尾。
+const accMergeOrder = fresh => {
+  const q = fresh.slice();
+  return accOrder.map(u => (q.includes(u) ? q.shift() : u)).concat(q);
+};
 const accCommitOrder = () => {                    // 把当前 DOM 顺序落定为「自定义」排序
-  accOrder = accOrderFromDom();
+  accOrder = accMergeOrder(accOrderFromDom());
   accSortMode = 'custom';
   $('accSort').value = 'custom';
   localStorage.setItem(LS_ACC_ORDER, accOrder.join(','));
@@ -595,6 +616,15 @@ $('accBody').addEventListener('dragend', ev => {
     accCommitOrder();
     renderAccounts((overviewData && overviewData.accounts) || []);
   }
+});
+
+/* realm 分页：CN 版 / 国际版 两个独立列表（选择持久化，同排序与拖拽顺序）。 */
+$('accTabs').addEventListener('click', ev => {
+  const b = ev.target.closest('button[data-dim]');
+  if (!b) return;
+  accTab = b.dataset.dim;
+  localStorage.setItem(LS_ACC_TAB, accTab);
+  renderAccounts((overviewData && overviewData.accounts) || []);
 });
 
 /* 账号池排序：选择持久化在 localStorage，跨会话记住（同「积分构成」页 pkSort）。 */
