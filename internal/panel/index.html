@@ -284,8 +284,31 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .rate-limit.model-unavailable { border-color: var(--line); background: var(--surface-2); color: var(--ink-3); }
 .rate-limit b { color: var(--ink); font-family: var(--mono); font-weight: 600; }
 .rate-limit span { color: var(--ink-2); }
-.acts { display: flex; gap: 5px; justify-content: flex-end; white-space: nowrap; }
+.acts { display: flex; align-items: center; gap: 5px; justify-content: flex-end; white-space: nowrap; }
 .acts button { padding: 3.5px 8px; font-size: 12.5px; white-space: nowrap; flex: none; }
+/* 启用/禁用开关：原生 checkbox（role=switch）+ CSS 外观，无 JS 状态机、无第三方库。 */
+.acts .tgl { position: relative; display: inline-flex; align-items: center; cursor: pointer; flex: none; }
+.acts .tgl input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.acts .tgl i { position: relative; display: block; width: 30px; height: 17px; border-radius: 999px; background: var(--line); transition: background .15s; }
+.acts .tgl i::after {
+  content: ''; position: absolute; top: 2px; left: 2px; width: 13px; height: 13px;
+  border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.35); transition: transform .15s;
+}
+.acts .tgl input:checked + i { background: var(--ok); }
+.acts .tgl input:checked + i::after { transform: translateX(13px); }
+.acts .tgl input:focus-visible + i { outline: 2px solid var(--accent); outline-offset: 2px; }
+.acts .tgl input:disabled + i { opacity: .55; }
+/* 账号列主轴改为 UUID：昵称默认折叠，点眼睛图标展开（两者位置互换）。 */
+.acc .who.c-uid { max-width: 320px; }
+.acc .who .uid { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--ink-2); }
+.acc .who .uid .u { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acc .who .nick { font-size: 11.5px; font-weight: 500; color: var(--ink-3); }
+.acc .who .eye {
+  flex: none; display: inline-flex; padding: 0; border: none; background: none;
+  color: var(--ink-3); cursor: pointer; line-height: 0; border-radius: 4px;
+}
+.acc .who .eye:hover { color: var(--accent); }
+.acc .who .eye svg { width: 13px; height: 13px; }
 
 .empty { padding: 40px 20px; text-align: center; color: var(--ink-3); }
 .empty .big { font-size: 14px; color: var(--ink-2); margin-bottom: 6px; }
@@ -663,6 +686,17 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <h3>账号池</h3>
           <span class="grow"></span>
           <span class="note" id="accNote"></span>
+          <label class="sel-note">排序
+            <select id="accSort">
+              <option value="default">上游默认顺序</option>
+              <option value="credits">积分 多 → 少</option>
+              <option value="credits_asc">积分 少 → 多</option>
+              <option value="healthy">状态（可用优先）</option>
+              <option value="success">成功次数 多 → 少</option>
+              <option value="last_success">最近成功 新 → 旧</option>
+              <option value="name">昵称 / UUID A → Z</option>
+            </select>
+          </label>
           <button class="xs" id="btnCheckinAll">全部签到</button>
           <button class="xs" id="btnTravelAll">旅行巡检</button>
           <button class="xs" id="btnActivityAll">活跃上报</button>

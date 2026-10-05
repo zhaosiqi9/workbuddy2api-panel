@@ -1,6 +1,6 @@
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
-const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
+const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme', LS_ACC_SORT = 'wb2api.accSort';
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
@@ -14,6 +14,8 @@ let reqEntries = [];
 let usDim = 'account', usCreditDim = 'account', usSort = 'total';
 let usageData = null;
 let reqRangeState = null; // 请求记录的时间范围（用量页的见 trangeState）
+let accSortMode = localStorage.getItem(LS_ACC_SORT) || 'default';   // 账号池排序（同积分构成页 pkSort）
+const nickShown = new Set();   // 账号池已展开昵称的 uid（点眼睛图标，仅前端显隐、不落盘）
 
 const $ = id => document.getElementById(id);
 
@@ -354,18 +356,47 @@ setTimeout(() => {
 }, 0);
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
+/* 昵称显隐用的睁眼/闭眼图标（内联 SVG，随 currentColor 变色，不引图标库）。 */
+const EYE_ON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M1.6 8S3.9 3.6 8 3.6 14.4 8 14.4 8 12.1 12.4 8 12.4 1.6 8 1.6 8z"/><circle cx="8" cy="8" r="1.9"/></svg>';
+const EYE_OFF = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M1.6 8S3.9 3.6 8 3.6 14.4 8 14.4 8 12.1 12.4 8 12.4 1.6 8 1.6 8z"/><circle cx="8" cy="8" r="1.9"/><path d="M2.6 13.4 13.4 2.6"/></svg>';
+
+// accCooldown 拆出熔断 / 连败降权剩余秒数与取大后的冷却秒数（渲染与排序共用）。
+function accCooldown(s) {
+  const left = t => { const d = (new Date(t || 0) - Date.now()) / 1000; return d > 0 ? d : 0; };
+  const bl = left(s.breaker_until), dg = left(s.degrade_until);
+  return { bl, dg, cool: Math.max(s.cool_remaining_sec || 0, bl, dg) };
+}
+
+// accRank 排序用健康度：0 可用 / 1 冷却 / 2 已禁用。
+function accRank(s) { return s.disabled ? 2 : (accCooldown(s).cool > 0 ? 1 : 0); }
+
+// accSortList 按当前排序条件返回新数组（不改动入参，'default' 即上游返回顺序）。
+function accSortList(list) {
+  if (accSortMode === 'default') return list;
+  const out = list.slice();
+  const num = v => { const n = Number(v || 0); return Number.isFinite(n) ? n : 0; };
+  const ts = v => { const t = Date.parse(v || ''); return Number.isFinite(t) ? t : 0; };
+  const nick = s => String(s.nickname || s.uid || '');
+  if (accSortMode === 'credits') out.sort((a, b) => num(b.credits) - num(a.credits));
+  else if (accSortMode === 'credits_asc') out.sort((a, b) => num(a.credits) - num(b.credits));
+  else if (accSortMode === 'healthy') out.sort((a, b) => accRank(a) - accRank(b) || num(b.credits) - num(a.credits));
+  else if (accSortMode === 'success') out.sort((a, b) => num(b.success_count) - num(a.success_count));
+  else if (accSortMode === 'last_success') out.sort((a, b) => ts(b.last_success) - ts(a.last_success));
+  else if (accSortMode === 'name') out.sort((a, b) => nick(a).localeCompare(nick(b)));
+  return out;
+}
+
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
     tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
+  list = accSortList(list);
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
   const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
   tb.innerHTML = list.map(s => {
-    const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
-    const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
-    const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
+    const { bl, dg, cool } = accCooldown(s);
     let cls = '', tag;
     if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
     else if (cool > 0) {
@@ -376,7 +407,6 @@ function renderAccounts(list) {
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
     const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
-    const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
     const pct = s.credits_total > 0
       ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
@@ -389,7 +419,6 @@ function renderAccounts(list) {
       credTip += '\n实测单价（credits/1K）：\n' + costs.map(c =>
         '  ' + c.model + '：' + (c.cost_per_1k <= 0 ? '免费' : c.cost_per_1k)).join('\n');
     }
-    const frozen = s.disabled || cool > 0;
     const tu = s.token_usage || {};
     const req = tu.request_count || 0;
     const totalTok = formatTokenCount(tu.total_tokens);
@@ -397,9 +426,15 @@ function renderAccounts(list) {
     const latency = formatLatency(tu.last_latency_ms);
     const rate = formatRate(tu.last_tokens_per_second);
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
+    const shown = nickShown.has(s.uid);
+    const nick = s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>';
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      // 账号列：主轴展示完整 UUID，昵称折叠在下、点眼睛图标展开（两者位置互换）
+      '<td class="who c-uid"><div class="id uid"><span class="u">' + esc(s.uid) + '</span>' +
+        (s.realm === 'global' ? '<span class="realm-tag">国际版</span>' : '') +
+        '<button class="eye" data-eye="' + esc(s.uid) + '" title="' + (shown ? '隐藏昵称' : '显示昵称') + '" aria-label="' + (shown ? '隐藏昵称' : '显示昵称') + '" aria-expanded="' + (shown ? 'true' : 'false') + '">' + (shown ? EYE_ON : EYE_OFF) + '</button>' +
+      '</div><div class="nm nick"' + (shown ? '' : ' hidden') + '>' + nick + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -415,8 +450,10 @@ function renderAccounts(list) {
         '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
         '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
-        (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
-                : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
+        (s.disabled || cool <= 0 ? '' : '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>') +
+        '<label class="tgl" title="' + (s.disabled ? '已禁用：点此启用（同时清除冷却 / 熔断）' : '启用中：点此禁用（不再参与选号）') + '">' +
+          '<input type="checkbox" role="switch" data-sw="' + esc(s.uid) + '" aria-label="启用或禁用该账号"' + (s.disabled ? '' : ' checked') + '><i></i>' +
+        '</label>' +
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
       '</td></tr>';
   }).join('');
@@ -448,11 +485,17 @@ async function loadOverview(quiet) {
 }
 
 $('accBody').addEventListener('click', async ev => {
+  const eye = ev.target.closest('button[data-eye]');
+  if (eye) {                                   // 眼睛图标：只切前端显隐，不打接口、不重拉数据
+    const u = eye.dataset.eye;
+    if (nickShown.has(u)) nickShown.delete(u); else nickShown.add(u);
+    renderAccounts((overviewData && overviewData.accounts) || []);
+    return;
+  }
   const b = ev.target.closest('button[data-a]');
   if (!b) return;
   const u = b.dataset.u, a = b.dataset.a;
   if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
-  if (a === 'disable' && !confirm('禁用后该账号不再参与选号，需手动解冻才能恢复。确认禁用？')) return;
   b.disabled = true;
   try {
     if (a === 'checkin') {
@@ -464,9 +507,6 @@ $('accBody').addEventListener('click', async ev => {
     } else if (a === 'revive') {
       await api('accounts/' + encodeURIComponent(u) + '/revive', { method: 'POST' });
       toast('已解冻', 'ok');
-    } else if (a === 'disable') {
-      await api('accounts/' + encodeURIComponent(u) + '/disable', { method: 'POST' });
-      toast('已禁用', 'ok');
     } else if (a === 'tasks') {
       openTasks(u);
     } else if (a === 'remove') {
@@ -476,6 +516,29 @@ $('accBody').addEventListener('click', async ev => {
   } catch (e) { toast(e.message, 'err'); }
   finally { b.disabled = false; loadOverview(true); }
 });
+
+/* 启用 / 禁用开关：勾上=启用（revive 顺带清冷却与熔断），取消=禁用。开关本身可逆，
+   误点再点回来即可，故不再弹确认框；失败时把勾回弹到原状态。 */
+$('accBody').addEventListener('change', async ev => {
+  const cb = ev.target.closest('input[data-sw]');
+  if (!cb) return;
+  const u = cb.dataset.sw, on = cb.checked;
+  cb.disabled = true;
+  try {
+    await api('accounts/' + encodeURIComponent(u) + '/' + (on ? 'revive' : 'disable'), { method: 'POST' });
+    toast(on ? '已启用' : '已禁用', 'ok');
+  } catch (e) { cb.checked = !on; toast(e.message, 'err'); }
+  finally { cb.disabled = false; loadOverview(true); }
+});
+
+/* 账号池排序：选择持久化在 localStorage，跨会话记住（同「积分构成」页 pkSort）。 */
+$('accSort').value = accSortMode;
+if (!$('accSort').value) { accSortMode = 'default'; $('accSort').value = 'default'; }   // 存量废弃值回落默认
+$('accSort').onchange = () => {
+  accSortMode = $('accSort').value;
+  localStorage.setItem(LS_ACC_SORT, accSortMode);
+  renderAccounts((overviewData && overviewData.accounts) || []);
+};
 
 $('btnCheckinAll').onclick = async () => {
   try { await api('checkin_all', { method: 'POST' }); toast('全部签到已开始，结果见日志', 'ok'); }
